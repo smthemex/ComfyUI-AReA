@@ -1,0 +1,15 @@
+[project]
+name = "area"
+description = "AReA is a training-free attention mechanism for generating images beyond the training resolution of diffusion transformers."
+version = "1.0.0"
+license = {file = "LICENSE"}
+
+[project.urls]
+Repository = "https://github.com/smthemex/ComfyUI-AReA"
+#  Used by Comfy Registry https://registry.comfy.org
+
+[tool.comfy]
+PublisherId = "smthemex"
+DisplayName = "ComfyUI-AReA"
+Icon = ""
+includes = []
