@@ -2,7 +2,7 @@
 [AReA](https://github.com/KooroshRH/AReA) is a training-free attention mechanism for generating images beyond the training resolution of diffusion transformers
 
 # Tip
-* only support flux now 
+* Support flux/qwen-image/ideogram now 
 
 # 1.Installation
 ```
@@ -15,6 +15,8 @@ turbo lora [flux turbo](https://huggingface.co/alimama-creative/FLUX.1-Turbo-Alp
 
 # 3.Example
 ![](https://github.com/smthemex/ComfyUI-AReA/blob/main/example_workflows/AReA-flux.png)
+![](https://github.com/smthemex/ComfyUI-AReA/blob/main/example_workflows/qwen.png)
+![](https://github.com/smthemex/ComfyUI-AReA/blob/main/example_workflows/ideogram.png)
 
 # 4.Citation
 ```

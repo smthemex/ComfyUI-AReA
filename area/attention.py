@@ -1,7 +1,10 @@
 """Backbone-independent parts of the two AReA attention phases.
 
-Ported from AReA (https://github.com/KooroshRH/AReA, Apache-2.0) with one change:
-diffusers' ``dispatch_attention_fn`` is replaced by a local torch SDPA wrapper.
+Ported from AReA (https://github.com/KooroshRH/AReA, Apache-2.0) with two changes:
+diffusers' ``dispatch_attention_fn`` is replaced by a local torch SDPA wrapper, and
+content-dependent pooling selections (medoid) are drawn from the first batch element
+and shared across the batch, so both branches of a batched classifier-free-guidance
+call pool with the same tokens (the ``memo`` the upstream true-CFG backbones use).
 Tensor layout stays ``[batch, sequence, heads, head_dim]`` with the sequence
 ordered ``[text | image]`` and image tokens row-major on an ``h x w`` grid.
 """
@@ -11,7 +14,6 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 from . import bridge, tiling
 
@@ -21,7 +23,7 @@ _MEDOID_CHUNK_ELEMS = 8_000_000
 
 def _sdpa(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     """Scaled dot product attention on [B, S, H, D] tensors (replaces dispatch_attention_fn)."""
-    return F.scaled_dot_product_attention(
+    return torch.nn.functional.scaled_dot_product_attention(
         q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
     ).transpose(1, 2)
 
@@ -41,18 +43,20 @@ def _block_selection(k_img: torch.Tensor, h: int, w: int, f: int, pooling: str,
         sel = np.random.default_rng(mix).integers(0, f * f, size=(nh, nw), dtype=np.int64)
         return torch.from_numpy(sel).to(k_img.device).unsqueeze(0).expand(b, nh, nw).contiguous()
     if pooling == "medoid":
-        grid = k_img.reshape(b, h, w, heads, dim)
+        # content-dependent: draw on the first batch element (the conditional branch of a
+        # batched CFG call) and share, matching the upstream memo semantics
+        grid = k_img[:1].reshape(1, h, w, heads, dim)
         rows_per_chunk = max(1, _MEDOID_CHUNK_ELEMS // max(1, nw * f * f * heads * dim))
         parts = []
         for r0 in range(0, nh, rows_per_chunk):
             r1 = min(nh, r0 + rows_per_chunk)
             kb = (grid[:, r0 * f : r1 * f]
-                  .reshape(b, r1 - r0, f, nw, f, heads, dim)
+                  .reshape(1, r1 - r0, f, nw, f, heads, dim)
                   .permute(0, 1, 3, 2, 4, 5, 6)
-                  .reshape(b, r1 - r0, nw, f * f, heads, dim)
+                  .reshape(1, r1 - r0, nw, f * f, heads, dim)
                   .float())
             parts.append((kb - kb.mean(dim=3, keepdim=True)).pow(2).sum(dim=(-2, -1)).argmin(dim=3))
-        return torch.cat(parts, dim=1)
+        return torch.cat(parts, dim=1).expand(b, nh, nw)
     return None
 
 
@@ -76,16 +80,22 @@ def _pool(x_img: torch.Tensor, h: int, w: int, f: int, pooling: str,
 
 
 def pool_keys_values(key: torch.Tensor, value: torch.Tensor, txt_len: int, h: int, w: int, f: int,
-                     pooling: str, seed: int = 0, step: int = 0, block: int = 0
+                     pooling: str, seed: int = 0, step: int = 0, block: int = 0, memo: Optional[dict] = None
                      ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Keep one token per ``f x f`` block of the image keys and values (text is never pooled).
 
     ``subsample`` keeps the block centre, ``mean`` averages the block, ``medoid`` keeps the token
     whose key is closest to the block-mean key, and ``random`` keeps a token drawn per
     (seed, step, block). Keys must be unrotated; K and V always come from the same token.
+    ``memo`` keeps the selection of the first call and replays it on later ones (unused on the
+    ComfyUI pipeline, where CFG branches share one batched forward).
     """
     k_img, v_img = key[:, txt_len:], value[:, txt_len:]
-    sel = _block_selection(k_img, h, w, f, pooling, seed, step, block)
+    sel = memo.get("pool") if memo is not None else None
+    if sel is None:
+        sel = _block_selection(k_img, h, w, f, pooling, seed, step, block)
+        if memo is not None and sel is not None:
+            memo["pool"] = sel
     k = torch.cat([key[:, :txt_len], _pool(k_img, h, w, f, pooling, sel)], dim=1)
     v = torch.cat([value[:, :txt_len], _pool(v_img, h, w, f, pooling, sel)], dim=1)
     return k, v
@@ -118,43 +128,46 @@ class FineLayout:
 
 
 def fit_extra_keys(windows: List[tiling.Window], h: int, w: int, txt_len: int, registers: int,
-                   halo: int) -> Tuple[int, int]:
-    """Bridge count and Halo width that keep one Phase II step at or below full attention.
+                   widths: List[Tuple[int, int, int, int]]) -> Tuple[int, List[Tuple[int, int, int, int]]]:
+    """Bridge count and Halo widths that keep one Phase II step at or below full attention.
 
     Each window runs ``T + n`` queries (text and its image tokens) against ``T + n`` keys plus its
     Halo ring and ``R`` bridge tokens, so the step costs ``sum (T+n)(T+n+ring+R)`` against
-    ``(T + h*w)^2``. The Halo is priced at its full width, the most any window can draw. The
-    bridge is cut first, to the largest count that fits; the Halo narrows only if the step is
+    ``(T + h*w)^2``. The rings are priced at the widths drawn by ``tiling.halo_widths``. The bridge
+    is cut first, to the largest count that fits; the Halo widths are capped only if the step is
     still above full attention without any bridge tokens.
     """
     full = float(txt_len + h * w) ** 2
     rows = [float(txt_len + win.area) for win in windows]
 
-    def local(depth: int) -> float:
-        return sum(q * (q + tiling.ring_size(win, depth, h, w)) for q, win in zip(rows, windows))
+    def capped(cap: int) -> List[Tuple[int, int, int, int]]:
+        return [tuple(min(d, cap) for d in sides) for sides in widths]
 
-    room = full - local(halo)
+    def local(cap: int) -> float:
+        return sum(q * (q + tiling.ring_size(win, sides, h, w)) for q, win, sides in zip(rows, windows, capped(cap)))
+
+    widest = max((max(sides) for sides in widths), default=0)
+    room = full - local(widest)
     if room >= registers * sum(rows):
-        return registers, halo
+        return registers, widths
     if room >= 0:
-        return int(room // sum(rows)), halo
-    depth = next((d for d in range(halo, -1, -1) if local(d) <= full), 0)
-    return 0, depth
+        return int(room // sum(rows)), widths
+    cap = next((c for c in range(widest, -1, -1) if local(c) <= full), 0)
+    return 0, capped(cap)
 
 
-def build_fine_layout(windows: List[tiling.Window], h: int, w: int, halo: int, registers: int,
-                      seed: int, step: int, dtype: torch.dtype, device) -> FineLayout:
+def build_fine_layout(windows: List[tiling.Window], h: int, w: int, widths: List[Tuple[int, int, int, int]],
+                      halo: int, registers: int, seed: int, step: int, dtype: torch.dtype, device) -> FineLayout:
     n_img = h * w
     tokens = [tiling.window_tokens(win, w, device) for win in windows]
     coverage = torch.zeros(n_img, dtype=dtype, device=device)
     for idx in tokens:
         coverage[idx] += 1.0
-    # every side of every window draws its own Halo width in [0, halo], fresh at each step, and every
-    # row or column along that side its own reach; the ring keeps the size of the straight-edged one
+    # the side widths come from tiling.halo_widths; every row or column along a side draws its own
+    # reach, fresh at each step, and the ring keeps the size of the straight-edged one
     rng = tiling.step_rng(seed, step, 0x4A10) if halo > 0 else None
-    rings = [tiling.jagged_halo_ring(win, tuple(int(d) for d in rng.integers(0, halo + 1, size=4)), halo, h, w,
-                                     rng, device)
-             if rng is not None else None for win in windows]
+    rings = [tiling.jagged_halo_ring(win, sides, halo, h, w, rng, device) if rng is not None else None
+             for win, sides in zip(windows, widths)]
     weights = tiling.merge_weights(windows, tokens, n_img, dtype, device)
     by_key: dict = {}
     for i, idx in enumerate(tokens):
@@ -172,20 +185,22 @@ def build_fine_layout(windows: List[tiling.Window], h: int, w: int, halo: int, r
 
 
 def windowed_attention(q_txt, k_txt, v_txt, q_img, k_img, v_img, k_img_unrotated,
-                       layout: FineLayout, backend=None) -> Tuple[torch.Tensor, torch.Tensor]:
+                       layout: FineLayout, backend=None, memo: Optional[dict] = None
+                       ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Attention inside each window, its keys extended by the Halo ring and the bridge tokens.
 
     Queries and keys are already rotated with their true grid positions; ``k_img_unrotated``
     ranks the bridge tokens. Window outputs are merged with the centre weights; the text
-    output is the mean over windows.
+    output is the mean over windows. ``memo`` keeps the bridge tokens of the first call and
+    replays them on later ones (unused on the ComfyUI pipeline).
     """
     b, t, heads, dim = q_txt.shape
     n_img = q_img.shape[1]
     out_img = torch.zeros(b, n_img, heads, dim, dtype=q_img.dtype, device=q_img.device)
     out_txt = torch.zeros(b, t, heads, dim, dtype=q_img.dtype, device=q_img.device)
-    score = bridge.token_importance(k_img_unrotated) if layout.registers > 0 else None
+    score = None
 
-    for group in layout.groups:
+    for i, group in enumerate(layout.groups):
         g, n = group.tokens.shape
         flat = group.tokens.reshape(-1)
 
@@ -194,8 +209,14 @@ def windowed_attention(q_txt, k_txt, v_txt, q_img, k_img, v_img, k_img_unrotated
             return torch.cat([x_txt.unsqueeze(1).expand(b, g, t, heads, dim), local], dim=2)
 
         extra_k, extra_v = [], []
-        if score is not None:
-            reg = bridge.select_registers(score, group.tokens, layout.registers, layout.h, layout.w).reshape(-1)
+        if layout.registers > 0:
+            reg = memo.get(("bridge", i)) if memo is not None else None
+            if reg is None:
+                if score is None:
+                    score = bridge.token_importance(k_img_unrotated)
+                reg = bridge.select_registers(score, group.tokens, layout.registers, layout.h, layout.w).reshape(-1)
+                if memo is not None:
+                    memo[("bridge", i)] = reg
             extra_k.append(k_img[:, reg].reshape(b, g, -1, heads, dim))
             extra_v.append(v_img[:, reg].reshape(b, g, -1, heads, dim))
         if group.halo is not None:
@@ -209,8 +230,7 @@ def windowed_attention(q_txt, k_txt, v_txt, q_img, k_img, v_img, k_img_unrotated
         out = _sdpa(q, k, v).reshape(b, g, t + n, heads, dim)
 
         out_txt += out[:, :, :t].sum(dim=1)
-        w = group.weights.to(out.dtype).view(1, -1, 1, 1)
-        out_img.index_add_(1, flat, out[:, :, t:].reshape(b, g * n, heads, dim) * w)
+        out_img.index_add_(1, flat, out[:, :, t:].reshape(b, g * n, heads, dim) * group.weights.view(1, -1, 1, 1))
 
     out_img = out_img / layout.coverage.to(out_img.dtype).clamp(min=1.0).view(1, n_img, 1, 1)
     out_txt = out_txt / max(float(len(layout.windows)), 1.0)
